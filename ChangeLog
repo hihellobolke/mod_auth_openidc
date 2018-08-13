@@ -1,3 +1,76 @@
+08/04/2018
+- don't return content with 503 since it will turn the HTTP status code into a 200; see #331
+- bump to 2.3.8rc2
+
+08/03/2018
+- add option to set an upper limit to the number of concurrent state cookies via OIDCStateMaxNumberOfCookies; see #331
+- make the default maximum number of parallel state cookies 7 instead of unlimited; see #331
+- bump to 2.3.8rc1
+
+07/30/2018
+- fix using access token as endpoint auth method in introspection calls; closes #377; thanks @skauffmann
+
+07/25/2018
+- fix reading access_token form POST parameters when combined with `AuthType auth-openidc`; see #376; thanks Nicolas Salerno
+- bump to 2.3.8rc0
+
+07/06/2018
+- abort when string length for remote user name substitution is larger than 255 characters
+- release 2.3.7
+
+07/04/2018
+- fix Redis concurrency issue when used with multiple vhosts
+- bump to 2.3.7rc4 and 2.3.7rc5
+
+06/29/2018
+- add support for authorization server metadata with OIDCOAuthServerMetadataURL as in RFC 8414
+- bump to 2.3.7rc3
+
+06/23/2018
+- refactor session object creation
+- bump to 2.3.7rc2
+
+06/22/2018
+- clear session cookie and contents if cache corruption is detected
+- bump to 2.3.7rc0
+- use apr_pstrdup when setting r->user
+- reserve 255 characters in remote username substition instead of 50
+- bump to 2.3.7rc1
+
+06/15/2018
+- add check to detect session cache corruption for server-based caches and cached static metadata
+- release 2.3.6
+
+05/29/2018
+- avoid using pipelining for Redis
+- bump to 2.3.6rc4
+
+05/28/2018
+- send Basic header in OAuth www-authenticate response if that's the only accepted method; thanks @puiterwijk
+
+05/28/2018
+- refactor Redis cache backend to solve issues on AUTH errors: a) memory leak and b) redisGetReply lagging behind
+- adjust copyright year/org
+- bump to 2.3.6rc3
+
+05/23/2018
+- fix buffer overflow in shm cache key set strcpy; thanks @kyprizel
+- bump to 2.3.6rc2
+
+05/22/2018
+- turn missing session_state from warning into a debug statement
+- fix missing "return" on error return from the OP; see #345; thanks @gergan
+- bump to 2.3.6rc1
+
+05/19/2018
+- explicitly set encryption kid so we're compatible with cjose >= 0.6.0
+- bump to 2.3.6rc0
+
+05/18/2018
+- fix encoding of preserved POST data; see #338; thanks @timpuri
+- avoid buffer overflow in shm cache key construction; thanks @kyprizel
+- release 2.3.5
+
 05/08/2018
 - compile with with Libressl; closes #358; thanks @hihellobolke
 - bump to 2.3.5rc0

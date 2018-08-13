@@ -18,6 +18,7 @@
  */
 
 /***************************************************************************
+ * Copyright (C) 2017-2018 ZmartZone IAM
  * Copyright (C) 2013-2017 Ping Identity Corporation
  * All rights reserved.
  *
@@ -300,6 +301,7 @@ typedef struct oidc_oauth_t {
 	int ssl_validate_server;
 	char *client_id;
 	char *client_secret;
+	char *metadata_url;
 	char *introspection_endpoint_tls_client_key;
 	char *introspection_endpoint_tls_client_cert;
 	char *introspection_endpoint_url;
@@ -377,6 +379,7 @@ typedef struct oidc_cfg {
 	int http_timeout_long;
 	int http_timeout_short;
 	int state_timeout;
+	int max_number_of_state_cookies;
 	int session_inactivity_timeout;
 	int session_cache_fallback_to_cookie;
 
@@ -429,7 +432,7 @@ apr_byte_t oidc_get_remote_user(request_rec *r, const char *claim_name, const ch
 #define OIDC_REDIRECT_URI_REQUEST_REQUEST_URI      "request_uri"
 
 // oidc_oauth
-int oidc_oauth_check_userid(request_rec *r, oidc_cfg *c);
+int oidc_oauth_check_userid(request_rec *r, oidc_cfg *c, const char *access_token);
 apr_byte_t oidc_oauth_get_bearer_token(request_rec *r, const char **access_token);
 
 // oidc_proto.c
@@ -684,6 +687,7 @@ int oidc_cfg_cache_encrypt(request_rec *r);
 int oidc_cfg_session_cache_fallback_to_cookie(request_rec *r);
 const char *oidc_parse_pkce_type(apr_pool_t *pool, const char *arg, oidc_proto_pkce_t **type);
 const char *oidc_cfg_claim_prefix(request_rec *r);
+int oidc_cfg_max_number_of_state_cookies(oidc_cfg *cfg);
 
 // oidc_util.c
 int oidc_strnenvcmp(const char *a, const char *b, int len);
@@ -787,9 +791,11 @@ void oidc_util_hdr_err_out_add(const request_rec *r, const char *name, const cha
 // oidc_metadata.c
 apr_byte_t oidc_metadata_provider_retrieve(request_rec *r, oidc_cfg *cfg, const char *issuer, const char *url, json_t **j_metadata, char **response);
 apr_byte_t oidc_metadata_provider_parse(request_rec *r, oidc_cfg *cfg, json_t *j_provider, oidc_provider_t *provider);
+apr_byte_t oidc_metadata_provider_is_valid(request_rec *r, oidc_cfg *cfg, json_t *j_provider, const char *issuer);
 apr_byte_t oidc_metadata_list(request_rec *r, oidc_cfg *cfg, apr_array_header_t **arr);
 apr_byte_t oidc_metadata_get(request_rec *r, oidc_cfg *cfg, const char *selected, oidc_provider_t **provider, apr_byte_t allow_discovery);
 apr_byte_t oidc_metadata_jwks_get(request_rec *r, oidc_cfg *cfg, const oidc_jwks_uri_t *jwks_uri, json_t **j_jwks, apr_byte_t *refresh);
+apr_byte_t oidc_oauth_metadata_provider_parse(request_rec *r, oidc_cfg *c, json_t *j_provider);
 
 // oidc_session.c
 typedef struct {

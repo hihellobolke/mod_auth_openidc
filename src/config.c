@@ -18,6 +18,7 @@
  */
 
 /***************************************************************************
+ * Copyright (C) 2017-2018 ZmartZone IAM
  * Copyright (C) 2013-2017 Ping Identity Corporation
  * All rights reserved.
  *
@@ -103,6 +104,8 @@
 #define OIDC_DEFAULT_SESSION_CLIENT_COOKIE_CHUNK_SIZE 4000
 /* timeout in seconds after which state expires */
 #define OIDC_DEFAULT_STATE_TIMEOUT 300
+/* maximum number of parallel state cookies; 0 means unlimited, until the browser or server gives up */
+#define OIDC_DEFAULT_MAX_NUMBER_OF_STATE_COOKIES 7
 /* default session inactivity timeout */
 #define OIDC_DEFAULT_SESSION_INACTIVITY_TIMEOUT 300
 /* default session max duration */
@@ -226,6 +229,7 @@
 #define OIDCHTTPTimeoutLong                  "OIDCHTTPTimeoutLong"
 #define OIDCHTTPTimeoutShort                 "OIDCHTTPTimeoutShort"
 #define OIDCStateTimeout                     "OIDCStateTimeout"
+#define OIDCStateMaxNumberOfCookies          "OIDCStateMaxNumberOfCookies"
 #define OIDCSessionInactivityTimeout         "OIDCSessionInactivityTimeout"
 #define OIDCMetadataDir                      "OIDCMetadataDir"
 #define OIDCSessionCacheFallbackToCookie     "OIDCSessionCacheFallbackToCookie"
@@ -254,6 +258,7 @@
 #define OIDCProviderMetadataRefreshInterval  "OIDCProviderMetadataRefreshInterval"
 #define OIDCProviderAuthRequestMethod        "OIDCProviderAuthRequestMethod"
 #define OIDCBlackListedClaims                "OIDCBlackListedClaims"
+#define OIDCOAuthServerMetadataURL           "OIDCOAuthServerMetadataURL"
 
 extern module AP_MODULE_DECLARE_DATA auth_openidc_module;
 
@@ -993,6 +998,27 @@ static const char *oidc_set_client_auth_bearer_token(cmd_parms *cmd,
 }
 
 /*
+ * set the maximun number of parallel state cookies
+ */
+static const char *oidc_set_max_number_of_state_cookies(cmd_parms *cmd,
+		void *struct_ptr, const char *arg) {
+	oidc_cfg *cfg = (oidc_cfg *) ap_get_module_config(
+			cmd->server->module_config, &auth_openidc_module);
+	const char *rv = oidc_parse_max_number_of_state_cookies(cmd->pool, arg,
+			&cfg->max_number_of_state_cookies);
+	return OIDC_CONFIG_DIR_RV(cmd, rv);
+}
+
+/*
+ * return the maximun number of parallel state cookies
+ */
+int oidc_cfg_max_number_of_state_cookies(oidc_cfg *cfg) {
+	if (cfg->max_number_of_state_cookies == OIDC_CONFIG_POS_INT_UNSET)
+		return OIDC_DEFAULT_MAX_NUMBER_OF_STATE_COOKIES;
+	return cfg->max_number_of_state_cookies;
+}
+
+/*
  * create a new server config record with defaults
  */
 void *oidc_create_server_config(apr_pool_t *pool, server_rec *svr) {
@@ -1047,6 +1073,7 @@ void *oidc_create_server_config(apr_pool_t *pool, server_rec *svr) {
 	c->provider.auth_request_method = OIDC_DEFAULT_AUTH_REQUEST_METHOD;
 
 	c->oauth.ssl_validate_server = OIDC_DEFAULT_SSL_VALIDATE_SERVER;
+	c->oauth.metadata_url = NULL;
 	c->oauth.client_id = NULL;
 	c->oauth.client_secret = NULL;
 	c->oauth.introspection_endpoint_tls_client_cert = NULL;
@@ -1099,6 +1126,7 @@ void *oidc_create_server_config(apr_pool_t *pool, server_rec *svr) {
 	c->http_timeout_long = OIDC_DEFAULT_HTTP_TIMEOUT_LONG;
 	c->http_timeout_short = OIDC_DEFAULT_HTTP_TIMEOUT_SHORT;
 	c->state_timeout = OIDC_DEFAULT_STATE_TIMEOUT;
+	c->max_number_of_state_cookies = OIDC_CONFIG_POS_INT_UNSET;
 	c->session_inactivity_timeout = OIDC_DEFAULT_SESSION_INACTIVITY_TIMEOUT;
 
 	c->cookie_domain = NULL;
@@ -1316,6 +1344,9 @@ void *oidc_merge_server_config(apr_pool_t *pool, void *BASE, void *ADD) {
 			add->oauth.ssl_validate_server != OIDC_DEFAULT_SSL_VALIDATE_SERVER ?
 					add->oauth.ssl_validate_server :
 					base->oauth.ssl_validate_server;
+	c->oauth.metadata_url =
+			add->oauth.metadata_url != NULL ?
+					add->oauth.metadata_url : base->oauth.metadata_url;
 	c->oauth.client_id =
 			add->oauth.client_id != NULL ?
 					add->oauth.client_id : base->oauth.client_id;
@@ -1410,6 +1441,10 @@ void *oidc_merge_server_config(apr_pool_t *pool, void *BASE, void *ADD) {
 	c->state_timeout =
 			add->state_timeout != OIDC_DEFAULT_STATE_TIMEOUT ?
 					add->state_timeout : base->state_timeout;
+	c->max_number_of_state_cookies =
+			add->max_number_of_state_cookies != OIDC_CONFIG_POS_INT_UNSET ?
+					add->max_number_of_state_cookies :
+					base->max_number_of_state_cookies;
 	c->session_inactivity_timeout =
 			add->session_inactivity_timeout
 			!= OIDC_DEFAULT_SESSION_INACTIVITY_TIMEOUT ?
@@ -1897,13 +1932,26 @@ static int oidc_check_config_openid_openidc(server_rec *s, oidc_cfg *c) {
  */
 static int oidc_check_config_oauth(server_rec *s, oidc_cfg *c) {
 
+	apr_uri_t r_uri;
+
+	if (c->oauth.metadata_url != NULL) {
+		apr_uri_parse(s->process->pconf, c->oauth.metadata_url, &r_uri);
+		if ((r_uri.scheme == NULL)
+				|| (apr_strnatcmp(r_uri.scheme, "https") != 0)) {
+			oidc_swarn(s,
+					"the URL scheme (%s) of the configured " OIDCOAuthServerMetadataURL " SHOULD be \"https\" for security reasons!",
+					r_uri.scheme);
+		}
+		return TRUE;
+	}
+
 	if (c->oauth.introspection_endpoint_url == NULL) {
 
 		if ((c->oauth.verify_jwks_uri == NULL)
 				&& (c->oauth.verify_public_keys == NULL)
 				&& (c->oauth.verify_shared_keys == NULL)) {
 			oidc_serror(s,
-					"one of '" OIDCOAuthIntrospectionEndpoint "', '" OIDCOAuthVerifyJwksUri "', '" OIDCOAuthVerifySharedKeys "' or '" OIDCOAuthVerifyCertFiles "' must be set");
+					"one of '" OIDCOAuthServerMetadataURL "', '" OIDCOAuthIntrospectionEndpoint "', '" OIDCOAuthVerifyJwksUri "', '" OIDCOAuthVerifySharedKeys "' or '" OIDCOAuthVerifyCertFiles "' must be set");
 			return HTTP_INTERNAL_SERVER_ERROR;
 		}
 
@@ -1935,7 +1983,8 @@ static int oidc_config_check_vhost_config(apr_pool_t *pool, server_rec *s) {
 			return HTTP_INTERNAL_SERVER_ERROR;
 	}
 
-	if ((cfg->oauth.client_id != NULL) || (cfg->oauth.client_secret != NULL)
+	if ((cfg->oauth.metadata_url != NULL) || (cfg->oauth.client_id != NULL)
+			|| (cfg->oauth.client_secret != NULL)
 			|| (cfg->oauth.introspection_endpoint_url != NULL)
 			|| (cfg->oauth.verify_jwks_uri != NULL)
 			|| (cfg->oauth.verify_public_keys != NULL)
@@ -2607,6 +2656,11 @@ const command_rec oidc_config_cmds[] = {
 				(void*)APR_OFFSETOF(oidc_cfg, state_timeout),
 				RSRC_CONF,
 				"Time to live in seconds for state parameter (cq. interval in which the authorization request and the corresponding response need to be completed)."),
+		AP_INIT_TAKE1(OIDCStateMaxNumberOfCookies,
+				oidc_set_max_number_of_state_cookies,
+				(void*)APR_OFFSETOF(oidc_cfg, max_number_of_state_cookies),
+				RSRC_CONF,
+				"Maximun number of parallel state cookies i.e. outstanding authorization requests."),
 		AP_INIT_TAKE1(OIDCSessionInactivityTimeout,
 				oidc_set_session_inactivity_timeout,
 				(void*)APR_OFFSETOF(oidc_cfg, session_inactivity_timeout),
@@ -2790,5 +2844,10 @@ const command_rec oidc_config_cmds[] = {
 				(void *) APR_OFFSETOF(oidc_cfg, white_listed_claims),
 				RSRC_CONF|ACCESS_CONF|OR_AUTHCFG,
 				"Specify claims from the userinfo and/or id_token that should be stored in the session (all other claims will be discarded)."),
+		AP_INIT_TAKE1(OIDCOAuthServerMetadataURL,
+				oidc_set_url_slot,
+				(void*)APR_OFFSETOF(oidc_cfg, oauth.metadata_url),
+				RSRC_CONF,
+				"Authorization Server metadata URL."),
 		{ NULL }
 };

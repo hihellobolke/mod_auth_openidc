@@ -18,6 +18,7 @@
  */
 
 /***************************************************************************
+ * Copyright (C) 2017-2018 ZmartZone IAM
  * Copyright (C) 2013-2017 Ping Identity Corporation
  * All rights reserved.
  *
@@ -316,8 +317,15 @@ static apr_byte_t oidc_provider_static_config(request_rec *r, oidc_cfg *c,
 
 	} else {
 
-		/* correct parsing and validation was already done when it was put in the cache */
 		oidc_util_decode_json_object(r, s_json, &j_provider);
+
+		/* check to see if it is valid metadata */
+		if (oidc_metadata_provider_is_valid(r, c, j_provider, NULL) == FALSE) {
+			oidc_error(r,
+					"cache corruption detected: invalid metadata from url: %s",
+					c->provider.metadata_url);
+			return FALSE;
+		}
 	}
 
 	*provider = apr_pcalloc(r->pool, sizeof(oidc_provider_t));
@@ -488,13 +496,21 @@ static int oidc_request_post_preserved_restore(request_rec *r,
 	const char *script =
 			apr_psprintf(r->pool,
 					"    <script type=\"text/javascript\">\n"
+					"      function str_decode(string) {\n"
+					"        try {\n"
+					"          result = decodeURIComponent(string);\n"
+					"        } catch (e) {\n"
+					"          result =  unescape(string);\n"
+					"        }\n"
+					"        return result;\n"
+					"      }\n"
 					"      function %s() {\n"
 					"        var mod_auth_openidc_preserve_post_params = JSON.parse(localStorage.getItem('mod_auth_openidc_preserve_post_params'));\n"
 					"		 localStorage.removeItem('mod_auth_openidc_preserve_post_params');\n"
 					"        for (var key in mod_auth_openidc_preserve_post_params) {\n"
 					"          var input = document.createElement(\"input\");\n"
-					"          input.name = decodeURIComponent(key);\n"
-					"          input.value = decodeURIComponent(mod_auth_openidc_preserve_post_params[key]);\n"
+					"          input.name = str_decode(key);\n"
+					"          input.value = str_decode(mod_auth_openidc_preserve_post_params[key]);\n"
 					"          input.type = \"hidden\";\n"
 					"          document.forms[0].appendChild(input);\n"
 					"        }\n"
@@ -670,8 +686,14 @@ static apr_byte_t oidc_unsolicited_proto_state(request_rec *r, oidc_cfg *c,
 	return TRUE;
 }
 
-static void oidc_clean_expired_state_cookies(request_rec *r, oidc_cfg *c,
+/*
+ * clean state cookies that have expired i.e. for outstanding requests that will never return
+ * successfully and return the number of remaining valid cookies/outstanding-requests while
+ * doing so
+ */
+static int oidc_clean_expired_state_cookies(request_rec *r, oidc_cfg *c,
 		const char *currentCookieName) {
+	int number_of_valid_state_cookies = 0;
 	char *cookie, *tokenizerCtx;
 	char *cookies = apr_pstrdup(r->pool, oidc_util_hdr_in_cookie_get(r));
 	if (cookies != NULL) {
@@ -699,6 +721,8 @@ static void oidc_clean_expired_state_cookies(request_rec *r, oidc_cfg *c,
 										cookieName);
 								oidc_util_set_cookie(r, cookieName, "", 0,
 										NULL);
+							} else {
+								number_of_valid_state_cookies++;
 							}
 							oidc_proto_state_destroy(proto_state);
 						}
@@ -708,6 +732,7 @@ static void oidc_clean_expired_state_cookies(request_rec *r, oidc_cfg *c,
 			cookie = apr_strtok(NULL, OIDC_STR_SEMI_COLON, &tokenizerCtx);
 		}
 	}
+	return number_of_valid_state_cookies;
 }
 
 /*
@@ -780,7 +805,7 @@ static apr_byte_t oidc_restore_proto_state(request_rec *r, oidc_cfg *c,
  * set the state that is maintained between an authorization request and an authorization response
  * in a cookie in the browser that is cryptographically bound to that state
  */
-static apr_byte_t oidc_authorization_request_set_cookie(request_rec *r,
+static int oidc_authorization_request_set_cookie(request_rec *r,
 		oidc_cfg *c, const char *state, oidc_proto_state_t *proto_state) {
 	/*
 	 * create a cookie consisting of 8 elements:
@@ -789,10 +814,40 @@ static apr_byte_t oidc_authorization_request_set_cookie(request_rec *r,
 	 */
 	char *cookieValue = oidc_proto_state_to_cookie(r, c, proto_state);
 	if (cookieValue == NULL)
-		return FALSE;
+		return HTTP_INTERNAL_SERVER_ERROR;
 
-	/* clean expired state cookies to avoid pollution */
-	oidc_clean_expired_state_cookies(r, c, NULL);
+	/*
+	 * clean expired state cookies to avoid pollution and optionally
+ 	 * try to avoid the number of state cookies exceeding a max
+	 */
+	int number_of_cookies = oidc_clean_expired_state_cookies(r, c, NULL);
+	int max_number_of_cookies = oidc_cfg_max_number_of_state_cookies(c);
+	if ((max_number_of_cookies > 0)
+			&& (number_of_cookies >= max_number_of_cookies)) {
+		oidc_warn(r,
+				"the number of existing, valid state cookies (%d) has exceeded the limit (%d), no additional authorization request + state cookie can be generated, aborting the request",
+				number_of_cookies, max_number_of_cookies);
+		/*
+		 * TODO: the html_send code below caters for the case that there's a user behind a
+		 * browser generating this request, rather than a piece of XHR code; how would an
+		 * XHR client handle this?
+		 */
+
+		/*
+		 * it appears that sending content with a 503 turns the HTTP status code
+		 * into a 200 so we'll avoid that for now: the user will see Apache specific
+		 * readable text anyway
+		 *
+		return oidc_util_html_send_error(r, c->error_template,
+				"Too Many Outstanding Requests",
+				apr_psprintf(r->pool,
+						"No authentication request could be generated since there are too many outstanding authentication requests already; you may have to wait up to %d seconds to be able to create a new request",
+						c->state_timeout),
+						HTTP_SERVICE_UNAVAILABLE);
+		*/
+
+		return HTTP_SERVICE_UNAVAILABLE;
+	}
 
 	/* assemble the cookie name for the state cookie */
 	const char *cookieName = oidc_get_state_cookie_name(r, state);
@@ -801,9 +856,7 @@ static apr_byte_t oidc_authorization_request_set_cookie(request_rec *r,
 	oidc_util_set_cookie(r, cookieName, cookieValue, -1,
 			c->cookie_same_site ? OIDC_COOKIE_EXT_SAME_SITE_LAX : NULL);
 
-	//free(s_value);
-
-	return TRUE;
+	return HTTP_OK;
 }
 
 /*
@@ -1357,7 +1410,7 @@ static int oidc_handle_existing_session(request_rec *r, oidc_cfg *cfg,
 	oidc_debug(r, "enter");
 
 	/* set the user in the main request for further (incl. sub-request) processing */
-	r->user = (char *) session->remote_user;
+	r->user = apr_pstrdup(r->pool, session->remote_user);
 	oidc_debug(r, "set remote_user to \"%s\"", r->user);
 
 	/* get the header name in which the remote user name needs to be passed */
@@ -1611,7 +1664,7 @@ static apr_byte_t oidc_set_request_user(request_rec *r, oidc_cfg *c,
 		remote_user = apr_psprintf(r->pool, "%s%s%s", remote_user, OIDC_STR_AT,
 				issuer);
 
-	r->user = remote_user;
+	r->user = apr_pstrdup(r->pool, remote_user);
 
 	oidc_debug(r, "set remote_user to \"%s\" based on claim: \"%s\"%s", r->user,
 			c->remote_user_claim.claim_name,
@@ -1672,7 +1725,7 @@ static apr_byte_t oidc_save_in_session(request_rec *r, oidc_cfg *c,
 		oidc_debug(r,
 				"session management disabled: \"check_session_iframe\" is not set in provider configuration");
 	} else {
-		oidc_warn(r,
+		oidc_debug(r,
 				"session management disabled: no \"session_state\" value is provided in the authentication response even though \"check_session_iframe\" (%s) is set in the provider configuration",
 				provider->check_session_iframe);
 	}
@@ -2229,12 +2282,19 @@ static int oidc_authenticate_user(request_rec *r, oidc_cfg *c,
 	/* get a hash value that fingerprints the browser concatenated with the random input */
 	char *state = oidc_get_browser_state_hash(r, nonce);
 
-	/* create state that restores the context when the authorization response comes in; cryptographically bind it to the browser */
-	if (oidc_authorization_request_set_cookie(r, c, state, proto_state) == FALSE)
-		return HTTP_INTERNAL_SERVER_ERROR;
+	/*
+	 * create state that restores the context when the authorization response comes in
+	 * and cryptographically bind it to the browser
+	 */
+	int rc = oidc_authorization_request_set_cookie(r, c, state, proto_state);
+	if (rc != HTTP_OK) {
+		oidc_proto_state_destroy(proto_state);
+		return rc;
+	}
 
 	/*
 	 * printout errors if Cookie settings are not going to work
+	 * TODO: separate this code out into its own function
 	 */
 	apr_uri_t o_uri;
 	memset(&o_uri, 0, sizeof(apr_uri_t));
@@ -2247,6 +2307,7 @@ static int oidc_authenticate_user(request_rec *r, oidc_cfg *c,
 		oidc_error(r,
 				"the URL scheme (%s) of the configured " OIDCRedirectURI " does not match the URL scheme of the URL being accessed (%s): the \"state\" and \"session\" cookies will not be shared between the two!",
 				r_uri.scheme, o_uri.scheme);
+		oidc_proto_state_destroy(proto_state);
 		return HTTP_INTERNAL_SERVER_ERROR;
 	}
 
@@ -2257,6 +2318,7 @@ static int oidc_authenticate_user(request_rec *r, oidc_cfg *c,
 				oidc_error(r,
 						"the URL hostname (%s) of the configured " OIDCRedirectURI " does not match the URL hostname of the URL being accessed (%s): the \"state\" and \"session\" cookies will not be shared between the two!",
 						r_uri.hostname, o_uri.hostname);
+				oidc_proto_state_destroy(proto_state);
 				return HTTP_INTERNAL_SERVER_ERROR;
 			}
 		}
@@ -2265,6 +2327,7 @@ static int oidc_authenticate_user(request_rec *r, oidc_cfg *c,
 			oidc_error(r,
 					"the domain (%s) configured in " OIDCCookieDomain " does not match the URL hostname (%s) of the URL being accessed (%s): setting \"state\" and \"session\" cookies will not work!!",
 					c->cookie_domain, o_uri.hostname, original_url);
+			oidc_proto_state_destroy(proto_state);
 			return HTTP_INTERNAL_SERVER_ERROR;
 		}
 	}
@@ -3002,7 +3065,7 @@ static int oidc_handle_info_request(request_rec *r, oidc_cfg *c,
 	}
 
 	/* set the user in the main request for further (incl. sub-request and authz) processing */
-	r->user = (char *) session->remote_user;
+	r->user = apr_pstrdup(r->pool, session->remote_user);
 
 	if (c->info_hook_data == NULL) {
 		oidc_warn(r, "no data configured to return in " OIDCInfoHook);
@@ -3219,7 +3282,7 @@ int oidc_handle_redirect_uri_request(request_rec *r, oidc_cfg *c,
 		//
 		//		/* send user facing error to browser */
 		//		return oidc_util_html_send_error(r, error, descr, DONE);
-		oidc_handle_redirect_authorization_response(r, c, session);
+		return oidc_handle_redirect_authorization_response(r, c, session);
 	}
 
 	oidc_error(r,
@@ -3344,7 +3407,7 @@ static int oidc_check_mixed_userid_oauth(request_rec *r, oidc_cfg *c) {
 	/* get the bearer access token from the Authorization header */
 	const char *access_token = NULL;
 	if (oidc_oauth_get_bearer_token(r, &access_token) == TRUE)
-		return oidc_oauth_check_userid(r, c);
+		return oidc_oauth_check_userid(r, c, access_token);
 
 	/* no bearer token found: then treat this as a regular OIDC browser request */
 	return oidc_check_userid_openidc(r, c);
@@ -3374,7 +3437,7 @@ int oidc_check_user_id(request_rec *r) {
 	/* see if we've configured OAuth 2.0 access control for this request */
 	if (apr_strnatcasecmp((const char *) ap_auth_type(r),
 			OIDC_AUTH_TYPE_OPENID_OAUTH20) == 0)
-		return oidc_oauth_check_userid(r, c);
+		return oidc_oauth_check_userid(r, c, NULL);
 
 	/* see if we've configured "mixed mode" for this request */
 	if (apr_strnatcasecmp((const char *) ap_auth_type(r),
